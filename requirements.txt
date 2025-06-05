@@ -1,0 +1,4 @@
+cffi==1.17.1 ; python_version >= "3.11" and python_version < "4"
+numpy==2.2.6 ; python_version >= "3.11" and python_version < "4"
+pycparser==2.22 ; python_version >= "3.11" and python_version < "4"
+sounddevice==0.5.2 ; python_version >= "3.11" and python_version < "4"

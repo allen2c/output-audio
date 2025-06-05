@@ -1,0 +1,29 @@
+[project]
+authors = [{ name = "Allen Chou", email = "f1470891079@gmail.com" }]
+dependencies = ["numpy (>=2,<3)", "sounddevice (>=0,<1)"]
+description = "Output audio with playlist."
+license = { text = "MIT" }
+name = "output-audio"
+readme = "README.md"
+requires-python = ">=3.11,<4"
+version = "0.1.0"
+
+[project.optional-dependencies]
+all = ["openai (>=1.53,<2.0)"]
+
+[tool.poetry.group.dev.dependencies]
+black = "*"
+codepress = ">=0.2"
+isort = "*"
+poetry-plugin-export = "^1.9.0"
+
+[tool.isort]
+profile = "black"
+
+[tool.flake8]
+ignore = ["E203", "E704", "W503"]
+max-line-length = 88
+
+[build-system]
+build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core>=2.0.0,<3.0.0"]
