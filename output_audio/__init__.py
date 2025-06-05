@@ -1,4 +1,5 @@
 import queue
+import threading
 import time
 import typing
 from abc import ABC, abstractmethod
@@ -93,7 +94,11 @@ class OpenAITextToSpeechProducer(PlaylistItem):
         self.set_loaded(True)
 
 
-def pa_callback_builder(audio_q: "queue.Queue[bytes]", leftover: "bytearray"):
+def pa_callback_builder(
+    audio_q: "queue.Queue[bytes]",
+    leftover: "bytearray",
+    played_event: threading.Event,
+):
 
     def pa_callback(outdata, frames, time, status):
         need = frames * CHANNELS * 2  # bytes
@@ -115,6 +120,10 @@ def pa_callback_builder(audio_q: "queue.Queue[bytes]", leftover: "bytearray"):
 
         outdata[:] = np.frombuffer(chunk, np.int16).reshape(-1, CHANNELS)
 
+        # mark the moment real audio hits the device
+        if not played_event.is_set() and any(chunk):  # any() skips all-silence
+            played_event.set()
+
     return pa_callback
 
 
@@ -127,14 +136,28 @@ def output_audio(
     audio_queue = queue.Queue(maxsize=200) if audio_queue is None else audio_queue
     leftover = bytearray() if leftover is None else leftover
 
+    first_bytes_played = threading.Event()
+
+    producers: list[threading.Thread] = []
+    for item in playlist:
+        t = threading.Thread(target=item.read_to_queue, daemon=True)
+        producers.append(t)
+        t.start()
+
     with sd.OutputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
         dtype=DTYPE,
         blocksize=BLOCK_FRAMES,
         latency="low",
-        callback=pa_callback_builder(audio_queue, leftover),
+        callback=pa_callback_builder(
+            audio_queue, leftover, played_event=first_bytes_played
+        ),
     ):
-        # TODO: add a thread to read from the audio queue
+        first_bytes_played.wait()
+
         while leftover or not audio_queue.empty():
             time.sleep(0.01)
+
+    for t in producers:
+        t.join(timeout=0.0)
