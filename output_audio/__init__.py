@@ -18,14 +18,12 @@ DTYPE = "int16"
 class PlaylistItem(ABC):
     def __init__(
         self,
-        audio_queue: "queue.Queue[bytes]",
         *args,
         playlist: typing.List["PlaylistItem"],
         has_played: bool = False,
         is_loaded: bool = False,
         **kwargs,
     ):
-        self.audio_queue = audio_queue
         self.playlist = playlist
 
         self.__has_played = has_played
@@ -50,18 +48,17 @@ class PlaylistItem(ABC):
                 return True
 
         else:
-            print(f"The playlist item {self} is not in the playlist!")
+            # The playlist item is not in the playlist
             return False
 
     @abstractmethod
-    def read_to_queue(self) -> None:
+    def read_to_queue(self, audio_queue: "queue.Queue[bytes]") -> None:
         raise NotImplementedError
 
 
 class OpenAITextToSpeechProducer(PlaylistItem):
     def __init__(
         self,
-        audio_queue: "queue.Queue[bytes]",
         *args,
         playlist: typing.List["PlaylistItem"],
         content: str,
@@ -70,7 +67,7 @@ class OpenAITextToSpeechProducer(PlaylistItem):
         openai_voice: str = "alloy",
         **kwargs,
     ):
-        super().__init__(audio_queue, *args, playlist=playlist, **kwargs)
+        super().__init__(*args, playlist=playlist, **kwargs)
 
         self.content = content
         self.openai_client = openai_client
@@ -78,18 +75,20 @@ class OpenAITextToSpeechProducer(PlaylistItem):
         self.openai_voice = openai_voice
 
     @typing_extensions.override
-    def read_to_queue(self) -> None:
+    def read_to_queue(self, audio_queue: "queue.Queue[bytes]") -> None:
         with self.openai_client.audio.speech.with_streaming_response.create(
             input=self.content,
             model=self.openai_model,
             voice=self.openai_voice,
+            instructions="Speak in clear Mandarin with a light Taiwanese accent. Keep a calm, neutral tone, avoid dramatic pitch swings. Pretend you are a newscaster reading headlines.",  # noqa: E501
             response_format="pcm",
+            speed=1.5,
         ) as resp:
             for chunk in resp.iter_bytes(chunk_size=4096):
                 while not self.all_previous_loaded():
                     time.sleep(0.1)
-                self.audio_queue.put(chunk)
-        self.audio_queue.put(b"\x00" * int(SAMPLE_RATE * 0.05) * 2)
+                audio_queue.put(chunk)
+        audio_queue.put(b"\x00" * int(SAMPLE_RATE * 0.05) * 2)
 
         self.set_loaded(True)
 
@@ -137,10 +136,27 @@ def output_audio(
     leftover = bytearray() if leftover is None else leftover
 
     first_bytes_played = threading.Event()
+    all_producers_done = threading.Event()
+    active_producers = []
+
+    def producer_wrapper(item):
+        try:
+            item.read_to_queue(audio_queue)
+        finally:
+            active_producers.remove(threading.current_thread())
+            if not active_producers:
+                all_producers_done.set()
+                # Add silence at the end to ensure all audio plays
+                audio_queue.put(b"\x00" * int(SAMPLE_RATE * 0.5) * 2)
 
     producers: list[threading.Thread] = []
     for item in playlist:
-        t = threading.Thread(target=item.read_to_queue, daemon=True)
+        t = threading.Thread(
+            target=producer_wrapper,
+            args=(item,),
+            daemon=True,
+        )
+        active_producers.append(t)
         producers.append(t)
         t.start()
 
@@ -156,8 +172,12 @@ def output_audio(
     ):
         first_bytes_played.wait()
 
-        while leftover or not audio_queue.empty():
+        # Keep playing until all producers are done AND queue is empty
+        while not all_producers_done.is_set() or not audio_queue.empty() or leftover:
             time.sleep(0.01)
 
+        # Extra time to ensure all audio plays through the buffer
+        time.sleep(1.0)
+
     for t in producers:
-        t.join(timeout=0.0)
+        t.join(timeout=0.1)
