@@ -1,183 +1,392 @@
+"""
+Stream Player - Low-latency sequential TTS audio streaming
+=========================================================
+
+A refactored audio streaming module that provides:
+* Strict sequential playback order
+* Immediate playback start (as soon as first PCM bytes arrive)
+* Background pre-streaming of subsequent items for zero-gap playback
+* Pydantic v2 data models for configuration
+* Producer-Merger-Player architecture for optimal performance
+
+Dependencies:
+    pip install pydantic numpy sounddevice openai typing_extensions
+
+Usage:
+    from openai import OpenAI
+    from output_audio import PlaylistItem, play_playlist
+
+    client = OpenAI(api_key="...")
+    items = [
+        PlaylistItem(idx=0, content="Hello world"),
+        PlaylistItem(idx=1, content="This is a test"),
+    ]
+    play_playlist(items, client)
+"""
+
+from __future__ import annotations
+
 import queue
 import threading
 import time
-import typing
-from abc import ABC, abstractmethod
+from enum import Enum
+from typing import List, Sequence, Union
 
 import numpy as np
 import openai
 import sounddevice as sd
-import typing_extensions
+from pydantic import BaseModel, ConfigDict, Field
 
-SAMPLE_RATE = 24_000
-CHANNELS = 1
-BLOCK_FRAMES = 1024
-DTYPE = "int16"
+# ──────────────────────────────────────────────────────────────
+# Audio Configuration Constants
+# ──────────────────────────────────────────────────────────────
 
+SAMPLE_RATE: int = 24_000  # Hz (matches OpenAI PCM output)
+CHANNELS: int = 1  # Mono audio
+DTYPE: str = "int16"  # 16-bit PCM samples
+BLOCK_FRAMES: int = 1024  # PortAudio callback buffer size
+CHUNK_BYTES: int = 4096  # TTS HTTP chunk size
 
-class PlaylistItem(ABC):
-    def __init__(
-        self,
-        *args,
-        playlist: typing.List["PlaylistItem"],
-        has_played: bool = False,
-        is_loaded: bool = False,
-        **kwargs,
-    ):
-        self.playlist = playlist
-
-        self.__has_played = has_played
-        self.__is_loaded = is_loaded
-
-    def set_played(self, has_played: bool) -> bool:
-        self.__has_played = has_played
-        return self.__has_played
-
-    def set_loaded(self, is_loaded: bool) -> bool:
-        self.__is_loaded = is_loaded
-        return self.__is_loaded
-
-    def all_previous_loaded(self) -> bool:
-        for item in self.playlist:
-            if item is not self:
-                if item.__is_loaded is True:
-                    pass
-                else:
-                    return False
-            elif item is self:
-                return True
-
-        else:
-            # The playlist item is not in the playlist
-            return False
-
-    @abstractmethod
-    def read_to_queue(self, audio_queue: "queue.Queue[bytes]") -> None:
-        raise NotImplementedError
+# Audio padding for seamless transitions
+ITEM_SILENCE: bytes = b"\x00" * int(SAMPLE_RATE * 0.05) * 2  # 50ms between items
+FINAL_SILENCE: bytes = b"\x00" * int(SAMPLE_RATE * 0.5) * 2  # 500ms at end
 
 
-class OpenAITextToSpeechProducer(PlaylistItem):
-    def __init__(
-        self,
-        *args,
-        playlist: typing.List["PlaylistItem"],
-        content: str,
-        openai_client: typing.Union["openai.OpenAI", "openai.AzureOpenAI"],
-        openai_model: str = "gpt-4o-mini-tts",
-        openai_voice: str = "alloy",
-        **kwargs,
-    ):
-        super().__init__(*args, playlist=playlist, **kwargs)
-
-        self.content = content
-        self.openai_client = openai_client
-        self.openai_model = openai_model
-        self.openai_voice = openai_voice
-
-    @typing_extensions.override
-    def read_to_queue(self, audio_queue: "queue.Queue[bytes]") -> None:
-        with self.openai_client.audio.speech.with_streaming_response.create(
-            input=self.content,
-            model=self.openai_model,
-            voice=self.openai_voice,
-            instructions="Speak in clear Mandarin with a light Taiwanese accent. Keep a calm, neutral tone, avoid dramatic pitch swings. Pretend you are a newscaster reading headlines.",  # noqa: E501
-            response_format="pcm",
-            speed=1.5,
-        ) as resp:
-            for chunk in resp.iter_bytes(chunk_size=4096):
-                while not self.all_previous_loaded():
-                    time.sleep(0.1)
-                audio_queue.put(chunk)
-        audio_queue.put(b"\x00" * int(SAMPLE_RATE * 0.05) * 2)
-
-        self.set_loaded(True)
+# ──────────────────────────────────────────────────────────────
+# Pydantic v2 Data Models
+# ──────────────────────────────────────────────────────────────
 
 
-def pa_callback_builder(
-    audio_q: "queue.Queue[bytes]",
-    leftover: "bytearray",
-    played_event: threading.Event,
-):
+class ItemState(str, Enum):
+    """Playback state for monitoring (not used for synchronization)."""
 
-    def pa_callback(outdata, frames, time, status):
-        need = frames * CHANNELS * 2  # bytes
+    IDLE = "idle"
+    STREAMING = "streaming"
+    DONE = "done"
 
-        chunk = bytearray(leftover)
-        leftover.clear()
 
-        while len(chunk) < need:
-            try:
-                chunk.extend(audio_q.get_nowait())
-            except queue.Empty:
+class TTSConfig(BaseModel):
+    """OpenAI Text-to-Speech configuration parameters."""
+
+    model: str = "gpt-4o-mini-tts"
+    voice: str = "alloy"
+    speed: float = 1.3
+    instructions: str = (
+        "Speak in clear Mandarin with a light Taiwanese accent. "
+        "Keep a calm, neutral tone, avoid dramatic pitch swings. "
+        "Pretend you are a newscaster reading headlines."
+    )
+
+
+class PlaylistItem(BaseModel):
+    """A single text segment to be converted to speech and played."""
+
+    idx: int = Field(..., description="Zero-based position in playlist")
+    content: str = Field(..., description="Text content to speak")
+    tts_config: TTSConfig = Field(default_factory=TTSConfig)
+    state: ItemState = Field(default=ItemState.IDLE)
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# Producer Thread (One per PlaylistItem)
+# ──────────────────────────────────────────────────────────────
+
+
+def _run_audio_producer(
+    item: PlaylistItem,
+    item_queue: "queue.Queue[bytes | None]",
+    openai_client: Union["openai.OpenAI", "openai.AzureOpenAI"],
+) -> None:
+    """
+    Streams TTS audio for a single item into its dedicated queue.
+
+    Args:
+        item: The playlist item to process
+        item_queue: Private queue for this item's audio data
+        openai_client: Configured OpenAI client
+    """
+    # Update state for monitoring (non-blocking)
+    item.state = ItemState.STREAMING
+
+    try:
+        # Stream TTS audio from OpenAI
+        with openai_client.audio.speech.with_streaming_response.create(
+            input=item.content,
+            model=item.tts_config.model,
+            voice=item.tts_config.voice,
+            instructions=item.tts_config.instructions,
+            response_format="pcm",  # Raw PCM for direct playback
+            speed=item.tts_config.speed,
+        ) as response:
+            # Stream chunks directly to queue as they arrive
+            for chunk in response.iter_bytes(chunk_size=CHUNK_BYTES):
+                item_queue.put(chunk)
+
+    except Exception as exc:
+        # On error, inject silence to keep playlist flowing
+        print(f"[Producer {item.idx}] Error: {exc!r}")
+        item_queue.put(ITEM_SILENCE)
+
+    finally:
+        # Signal completion with sentinel value
+        item_queue.put(None)  # Merger will recognize this as end-of-item
+        item.state = ItemState.DONE
+
+
+# ──────────────────────────────────────────────────────────────
+# Merger Thread (Sequential Order Controller)
+# ──────────────────────────────────────────────────────────────
+
+
+def _run_audio_merger(
+    global_queue: "queue.Queue[bytes]",
+    item_queues: Sequence["queue.Queue[bytes | None]"],
+) -> None:
+    """
+    Merges individual item queues into global playback queue in order.
+
+    This ensures strict sequential playback while allowing parallel
+    background streaming of subsequent items.
+
+    Args:
+        global_queue: Main audio queue consumed by PortAudio
+        item_queues: Per-item queues in playlist order
+    """
+    for item_idx, item_queue in enumerate(item_queues):
+        while True:
+            chunk = item_queue.get()  # Blocks until data available
+
+            if chunk is None:  # End-of-item sentinel
+                # Add brief silence between items to prevent audio artifacts
+                global_queue.put(ITEM_SILENCE)
                 break
 
-        if len(chunk) < need:
-            chunk.extend(b"\x00" * (need - len(chunk)))
-        elif len(chunk) > need:
-            leftover.extend(chunk[need:])  # for next round
-            chunk = chunk[:need]
+            # Forward audio chunk to global playback queue
+            global_queue.put(chunk)
 
-        outdata[:] = np.frombuffer(chunk, np.int16).reshape(-1, CHANNELS)
-
-        # mark the moment real audio hits the device
-        if not played_event.is_set() and any(chunk):  # any() skips all-silence
-            played_event.set()
-
-    return pa_callback
+    # Add final silence to ensure complete playback
+    global_queue.put(FINAL_SILENCE)
 
 
-def output_audio(
-    playlist: typing.List[PlaylistItem],
-    *,
-    audio_queue: typing.Optional["queue.Queue[bytes]"] = None,
-    leftover: typing.Optional["bytearray"] = None,
+# ──────────────────────────────────────────────────────────────
+# PortAudio Callback Builder
+# ──────────────────────────────────────────────────────────────
+
+
+def _create_audio_callback(
+    global_queue: "queue.Queue[bytes]",
+    buffer_remainder: bytearray,
+    playback_started: threading.Event,
 ):
-    audio_queue = queue.Queue(maxsize=200) if audio_queue is None else audio_queue
-    leftover = bytearray() if leftover is None else leftover
+    """
+    Creates PortAudio callback function for real-time audio output.
 
-    first_bytes_played = threading.Event()
-    all_producers_done = threading.Event()
-    active_producers = []
+    Args:
+        global_queue: Source of audio data
+        buffer_remainder: Carries over partial frames between callbacks
+        playback_started: Event signaled when actual audio begins
 
-    def producer_wrapper(item):
-        try:
-            item.read_to_queue(audio_queue)
-        finally:
-            active_producers.remove(threading.current_thread())
-            if not active_producers:
-                all_producers_done.set()
-                # Add silence at the end to ensure all audio plays
-                audio_queue.put(b"\x00" * int(SAMPLE_RATE * 0.5) * 2)
+    Returns:
+        Configured callback function for PortAudio
+    """
 
-    producers: list[threading.Thread] = []
-    for item in playlist:
-        t = threading.Thread(
-            target=producer_wrapper,
-            args=(item,),
+    def audio_callback(outdata, frames, time_info, status):
+        bytes_needed = frames * CHANNELS * 2  # 16-bit samples = 2 bytes each
+
+        # Start with any leftover data from previous callback
+        audio_buffer = bytearray(buffer_remainder)
+        buffer_remainder.clear()
+
+        # Fill buffer from queue until we have enough data
+        while len(audio_buffer) < bytes_needed:
+            try:
+                audio_buffer.extend(global_queue.get_nowait())
+            except queue.Empty:
+                break  # No more data available right now
+
+        # Handle buffer size mismatches
+        if len(audio_buffer) < bytes_needed:
+            # Pad with silence if insufficient data
+            audio_buffer.extend(b"\x00" * (bytes_needed - len(audio_buffer)))
+        elif len(audio_buffer) > bytes_needed:
+            # Save excess for next callback
+            buffer_remainder.extend(audio_buffer[bytes_needed:])
+            audio_buffer = audio_buffer[:bytes_needed]
+
+        # Convert to numpy array and output
+        outdata[:] = np.frombuffer(audio_buffer, np.int16).reshape(-1, CHANNELS)
+
+        # Signal when first real audio (non-silence) starts playing
+        if not playback_started.is_set() and any(audio_buffer):
+            playback_started.set()
+
+    return audio_callback
+
+
+# ──────────────────────────────────────────────────────────────
+# Main Playback Function
+# ──────────────────────────────────────────────────────────────
+
+
+def play_playlist(
+    items: List[PlaylistItem],
+    openai_client: Union["openai.OpenAI", "openai.AzureOpenAI"],
+) -> None:
+    """
+    Plays a list of TTS items with minimal latency and zero gaps.
+
+    This function:
+    1. Starts all TTS producers in parallel (background streaming)
+    2. Begins playback as soon as first audio bytes arrive
+    3. Maintains strict sequential order via the merger
+    4. Blocks until all audio has finished playing
+
+    Args:
+        items: List of playlist items to play in order
+        openai_client: Configured OpenAI client for TTS
+    """
+    if not items:
+        return
+
+    # Create individual queues for each playlist item
+    item_queues = [queue.Queue(maxsize=150) for _ in items]
+
+    # Start producer threads - all run in parallel for background streaming
+    producer_threads = []
+    for item, item_queue in zip(items, item_queues):
+        thread = threading.Thread(
+            target=_run_audio_producer,
+            args=(item, item_queue, openai_client),
+            name=f"Producer-{item.idx}",
             daemon=True,
         )
-        active_producers.append(t)
-        producers.append(t)
-        t.start()
+        producer_threads.append(thread)
+        thread.start()
 
+    # Global queue that feeds the audio output device
+    global_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=300)
+
+    # Start merger thread - maintains sequential order
+    merger_thread = threading.Thread(
+        target=_run_audio_merger,
+        args=(global_queue, item_queues),
+        name="Merger",
+        daemon=True,
+    )
+    merger_thread.start()
+
+    # Set up audio output
+    buffer_remainder = bytearray()
+    playback_started = threading.Event()
+
+    # Start PortAudio stream - this begins immediate playback
     with sd.OutputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
         dtype=DTYPE,
         blocksize=BLOCK_FRAMES,
-        latency="low",
-        callback=pa_callback_builder(
-            audio_queue, leftover, played_event=first_bytes_played
+        latency="low",  # Minimize audio latency
+        callback=_create_audio_callback(
+            global_queue, buffer_remainder, playback_started
         ),
     ):
-        first_bytes_played.wait()
+        # Wait for first audio to start playing
+        playback_started.wait()
 
-        # Keep playing until all producers are done AND queue is empty
-        while not all_producers_done.is_set() or not audio_queue.empty() or leftover:
+        # Wait for merger to finish processing all items
+        merger_thread.join()
+
+        # Continue playing until all audio data is consumed
+        while not global_queue.empty() or buffer_remainder:
             time.sleep(0.01)
 
-        # Extra time to ensure all audio plays through the buffer
+        # Allow hardware buffer to drain completely
         time.sleep(1.0)
 
-    for t in producers:
-        t.join(timeout=0.1)
+    # Clean up producer threads
+    for thread in producer_threads:
+        thread.join(timeout=0.1)
+
+
+# ──────────────────────────────────────────────────────────────
+# Utility Functions
+# ──────────────────────────────────────────────────────────────
+
+
+def create_playlist(texts: Sequence[str], **tts_kwargs) -> List[PlaylistItem]:
+    """
+    Convenience function to create a playlist from text strings.
+
+    Args:
+        texts: Sequence of text strings to convert to speech
+        **tts_kwargs: Optional TTS configuration overrides
+
+    Returns:
+        List of configured PlaylistItem objects
+    """
+    tts_config = TTSConfig(**tts_kwargs) if tts_kwargs else TTSConfig()
+
+    return [
+        PlaylistItem(idx=i, content=text, tts_config=tts_config)
+        for i, text in enumerate(texts)
+    ]
+
+
+# ──────────────────────────────────────────────────────────────
+# Demo / Testing
+# ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("🎵 Demo Mode: Playing sine wave instead of TTS")
+    print("   (Replace with real OpenAI client for actual TTS)\n")
+
+    # Demo with synthetic audio instead of TTS
+    import math
+
+    def _demo_producer(item: PlaylistItem, q: "queue.Queue[bytes | None]", _client):
+        """Generate a 440Hz sine wave for 2 seconds instead of TTS."""
+        item.state = ItemState.STREAMING
+
+        frequency = 440 + (item.idx * 110)  # Different pitch per item
+        duration_seconds = 2
+        total_samples = int(SAMPLE_RATE * duration_seconds)
+
+        try:
+            for start_sample in range(0, total_samples, CHUNK_BYTES // 2):
+                chunk_samples = min(CHUNK_BYTES // 2, total_samples - start_sample)
+
+                # Generate sine wave samples
+                samples = []
+                for i in range(chunk_samples):
+                    t = (start_sample + i) / SAMPLE_RATE
+                    amplitude = int(0.3 * 32767 * math.sin(2 * math.pi * frequency * t))
+                    samples.append(amplitude)
+
+                # Convert to bytes and queue
+                audio_data = np.array(samples, dtype=np.int16).tobytes()
+                q.put(audio_data)
+
+        finally:
+            q.put(None)  # End sentinel
+            item.state = ItemState.DONE
+
+    # Replace the real producer for demo
+    globals()["_run_audio_producer"] = _demo_producer
+
+    # Create demo playlist
+    demo_items = create_playlist(
+        [
+            "First item (440 Hz)",
+            "Second item (550 Hz)",
+            "Third item (660 Hz)",
+        ]
+    )
+
+    # Play demo
+    play_playlist(demo_items, openai_client=None)  # type: ignore[arg-type]
+    print("✅ Demo completed!")
