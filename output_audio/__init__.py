@@ -37,13 +37,16 @@ class AudioConfig(pydantic.BaseModel):
 
 
 class TTSAudioConfig(AudioConfig):
+    # model: str = "tts-1"
     model: str = "gpt-4o-mini-tts"
-    voice: str = "alloy"
-    speed: float = 1.25
+    voice: str = "nova"
+    speed: float = 1.0
     instructions: str = (
-        "Speak in a gentle and graceful female tone, "
-        + "as if having a casual conversation, and maintain a fast speaking rate."
-    )
+        "Voice: Warm, upbeat, and reassuring, with a steady and confident cadence that keeps the conversation calm and productive. "  # noqa: E501
+        "Speak at a *very fast* pace while maintaining clarity and emotional warmth. "
+        "Tone: Positive and solution-oriented, always focusing on the next steps rather than dwelling on the problem. "  # noqa: E501
+        "Dialect: Neutral and professional, avoiding overly casual speech but maintaining a friendly and approachable style."  # noqa: E501
+    ).strip()
     openai_client: typing.Union["openai.OpenAI", "openai.AzureOpenAI"] = pydantic.Field(
         default_factory=lambda: openai.OpenAI()
     )
