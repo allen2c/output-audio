@@ -17,6 +17,9 @@ DTYPE: str = "int16"  # 16-bit PCM samples
 BLOCK_FRAMES: int = 1024  # PortAudio callback buffer size
 CHUNK_BYTES: int = 4096  # TTS HTTP chunk size
 
+# Pre-buffering configuration
+PRE_BUFFER_DURATION: float = 0.2  # Seconds of audio to buffer before playback starts
+
 # Audio padding for seamless transitions
 ITEM_SILENCE: bytes = b"\x00" * int(SAMPLE_RATE * 0.05) * 2  # 50ms between items
 FINAL_SILENCE: bytes = b"\x00" * int(SAMPLE_RATE * 0.2) * 2  # 200ms at end
@@ -227,18 +230,46 @@ class Playlist(pydantic.BaseModel):
         # Update state for monitoring (non-blocking)
         item.state = ItemState.STREAMING
 
+        # Pre-buffering mechanism: accumulate initial data before playback
+        initial_buffer = []
+        # Calculate buffer size based on audio parameters
+        bytes_per_sample = 2  # 16-bit PCM
+        initial_buffer_size = int(
+            SAMPLE_RATE * CHANNELS * bytes_per_sample * PRE_BUFFER_DURATION
+        )
+        current_buffer_size = 0
+
         try:
             for chunk in item.audio_item.read(chunk_size=CHUNK_BYTES):
                 if self.stop_event.is_set():
                     break
-                item.audio_queue.put(chunk)
+
+                # Accumulate initial buffer
+                if current_buffer_size < initial_buffer_size:
+                    initial_buffer.append(chunk)
+                    current_buffer_size += len(chunk)
+
+                    # Release all buffered data once we have enough
+                    if current_buffer_size >= initial_buffer_size:
+                        for buffered_chunk in initial_buffer:
+                            item.audio_queue.put(buffered_chunk)
+                        initial_buffer = []  # Clear buffer list
+                else:
+                    # Initial buffer already released, put directly to queue
+                    item.audio_queue.put(chunk)
 
         except Exception as exc:
             # On error, inject silence to keep playlist flowing
             print(f"[Producer {item.idx}] Error: {exc!r}")
+            # Release any remaining buffered data
+            for buffered_chunk in initial_buffer:
+                item.audio_queue.put(buffered_chunk)
             item.audio_queue.put(ITEM_SILENCE)
 
         finally:
+            # Ensure all buffered data is released
+            for buffered_chunk in initial_buffer:
+                item.audio_queue.put(buffered_chunk)
             # Signal completion with sentinel value
             item.audio_queue.put(None)  # Merger will recognize this as end-of-item
             item.state = ItemState.DONE
@@ -337,7 +368,7 @@ def output_audio(audio_items: typing.Sequence[AudioItem]) -> None:
         channels=CHANNELS,
         dtype=DTYPE,
         blocksize=BLOCK_FRAMES,
-        latency="low",  # Minimize audio latency
+        latency=0.2,  # 200ms latency works with pre-buffering mechanism
         callback=create_audio_callback(
             playback_queue, buffer_remainder, playback_started
         ),
