@@ -1,3 +1,4 @@
+# /Users/allenchou/works/ac/output-audio/output_audio/__init__.py
 import queue
 import threading
 import time
@@ -127,6 +128,7 @@ class Playlist(pydantic.BaseModel):
         default_factory=threading.Event,
         description="Event to signal when playback should stop",
     )
+    current_idx: int = pydantic.Field(default=0, description="Next item to play")
 
     model_config = pydantic.ConfigDict(
         validate_assignment=True, arbitrary_types_allowed=True
@@ -148,6 +150,17 @@ class Playlist(pydantic.BaseModel):
     def __delitem__(self, idx: int) -> None:
         del self.items[idx]
 
+    def add_item(self, audio_item: AudioItem) -> None:
+        """Dynamically add an item to the playlist."""
+
+        item = PlaylistItem(idx=len(self.items), audio_item=audio_item)
+        self.items.append(item)
+
+        if self.start_event.is_set():
+            thread = threading.Thread(target=self._run_audio_producer, args=(item,))
+            self.audio_producer_threads.append(thread)
+            thread.start()
+
     def play(
         self,
         playback_queue: "queue.Queue[bytes | None]",
@@ -155,40 +168,41 @@ class Playlist(pydantic.BaseModel):
         max_playback_time: float = 10.0,
     ) -> None:
         """
-        Merges individual item queues into global playback queue in order.
-
-        This ensures strict sequential playback while allowing parallel
-        background streaming of subsequent items.
+        Merge individual item queues into a single playback_queue
+        while allowing dynamic insertion of new items.
         """
         self.start_audio_producer()
-
         start_time = time.time()
 
         try:
-            for audio_item in self.items:
-                while True:
-                    if time.time() - start_time > max_playback_time:
-                        print(
-                            "Playlist playback timed out after "
-                            + f"{max_playback_time} seconds"
-                        )
-                        raise ManualStopException("Playlist playback timed out")
-
+            while True:
+                # Wait until at least one un-played item is available
+                while self.current_idx >= len(self.items):
                     if self.stop_event.is_set():
-                        print("Playlist playback stopped")
-                        raise ManualStopException("Playlist playback stopped")
+                        raise ManualStopException("Stop requested")
 
-                    chunk = audio_item.audio_queue.get()  # Blocks until data available
+                    if time.time() - start_time > max_playback_time:
+                        raise ManualStopException("Playback timed out")
 
-                    if chunk is None:  # End-of-item sentinel
-                        # Add brief silence between items to prevent audio artifacts
+                    time.sleep(0.05)  # small poll-sleep; keeps CPU low
+
+                # Consume the next item
+                audio_item = self.items[self.current_idx]
+                self.current_idx += 1  # advance for the next loop
+
+                while True:
+                    if self.stop_event.is_set():
+                        raise ManualStopException("Stop requested")
+
+                    chunk = audio_item.audio_queue.get()
+
+                    if chunk is None:  # end-of-item sentinel
                         playback_queue.put(ITEM_SILENCE)
                         break
 
-                    # Forward audio chunk to global playback queue
                     playback_queue.put(chunk)
 
-            # Add final silence to ensure complete playback
+            # Add final silence once every queued item has finished
             playback_queue.put(FINAL_SILENCE)
 
         except ManualStopException:
@@ -197,6 +211,7 @@ class Playlist(pydantic.BaseModel):
     def start_audio_producer(self):
         if self.start_event.is_set():
             return
+
         self.start_event.set()
         self.stop_event.clear()
 
@@ -222,6 +237,7 @@ class Playlist(pydantic.BaseModel):
         self.audio_producer_threads.clear()
         self.start_event.clear()
         self.stop_event.clear()
+        self.current_idx = 0
 
     def _run_audio_producer(self, item: PlaylistItem) -> None:
         """
@@ -340,8 +356,8 @@ def output_audio(audio_items: typing.Sequence[AudioItem]) -> None:
 
     # Create playlist
     playlist = Playlist()
-    for idx, audio_item in enumerate(audio_items):
-        playlist.items.append(PlaylistItem(idx=idx, audio_item=audio_item))
+    for audio_item in audio_items:
+        playlist.add_item(audio_item)
 
     # Start audio producers
     playlist.start_audio_producer()
@@ -385,6 +401,61 @@ def output_audio(audio_items: typing.Sequence[AudioItem]) -> None:
 
         # Allow hardware buffer to drain completely
         time.sleep(0.5)
+
+    # Clean up producer threads
+    playlist.on_stop()
+
+
+def output_playlist_audio(
+    playlist: Playlist,
+    *,
+    playback_stop_event: threading.Event | None = None,
+) -> None:
+    # Start audio producers
+    playlist.start_audio_producer()
+
+    # Global queue that feeds the audio output device
+    playback_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=300)
+
+    # Start playlist playback
+    playlist_playback_thread = threading.Thread(
+        target=playlist.play,
+        args=(playback_queue,),
+        name="Playlist Playback",
+        daemon=True,
+    )
+    playlist_playback_thread.start()
+
+    # Set up audio output
+    buffer_remainder = bytearray()
+    playback_started = threading.Event()
+
+    # Start PortAudio stream - this begins immediate playback
+    with sd.OutputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype=DTYPE,
+        blocksize=BLOCK_FRAMES,
+        latency=0.2,  # 200ms latency works with pre-buffering mechanism
+        callback=create_audio_callback(
+            playback_queue, buffer_remainder, playback_started
+        ),
+    ):
+        # Wait for first audio to start playing
+        playback_started.wait()
+
+        # Wait for playlist playback to finish
+        playlist_playback_thread.join()
+
+        # Continue playing until all audio data is consumed
+        while not playback_queue.empty() or buffer_remainder:
+            time.sleep(0.01)
+
+        if playback_stop_event is not None:
+            playback_stop_event.wait()
+        else:
+            # Allow hardware buffer to drain completely
+            time.sleep(0.5)
 
     # Clean up producer threads
     playlist.on_stop()
