@@ -1,19 +1,16 @@
 import queue
 import threading
 import time
+import typing
 from enum import Enum
-from typing import Generator, List, Union
 
 import numpy as np
 import openai
+import pydantic
 import sounddevice as sd
-from pydantic import BaseModel, ConfigDict, Field
-from typing_extensions import override
+import typing_extensions
 
-# ──────────────────────────────────────────────────────────────
 # Audio Configuration Constants
-# ──────────────────────────────────────────────────────────────
-
 SAMPLE_RATE: int = 24_000  # Hz (matches OpenAI PCM output)
 CHANNELS: int = 1  # Mono audio
 DTYPE: str = "int16"  # 16-bit PCM samples
@@ -33,8 +30,10 @@ class ItemState(str, Enum):
     DONE = "done"
 
 
-class AudioConfig(BaseModel):
-    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+class AudioConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(
+        validate_assignment=True, arbitrary_types_allowed=True
+    )
 
 
 class TTSAudioConfig(AudioConfig):
@@ -45,35 +44,35 @@ class TTSAudioConfig(AudioConfig):
         "Speak in a gentle and graceful female tone, "
         + "as if having a casual conversation, and maintain a fast speaking rate."
     )
-    openai_client: Union["openai.OpenAI", "openai.AzureOpenAI"] = Field(
+    openai_client: typing.Union["openai.OpenAI", "openai.AzureOpenAI"] = pydantic.Field(
         default_factory=lambda: openai.OpenAI()
     )
 
 
-class AudioItem(BaseModel):
-    model_config = ConfigDict(validate_assignment=True)
+class AudioItem(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(validate_assignment=True)
 
     audio_config: AudioConfig | None = None
 
     def read(
         self,
         chunk_size: int = CHUNK_BYTES,
-    ) -> Generator[bytes, None, None]:
+    ) -> typing.Generator[bytes, None, None]:
         raise NotImplementedError
 
 
 class OpenAITTSAudioItem(AudioItem):
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = pydantic.ConfigDict(validate_assignment=True)
 
     audio_config: TTSAudioConfig | None = None
 
     content: str
 
-    @override
+    @typing_extensions.override
     def read(
         self,
         chunk_size: int = CHUNK_BYTES,
-    ) -> Generator[bytes, None, None]:
+    ) -> typing.Generator[bytes, None, None]:
         audio_config = (
             TTSAudioConfig() if self.audio_config is None else self.audio_config
         )
@@ -92,38 +91,42 @@ class OpenAITTSAudioItem(AudioItem):
                 yield chunk
 
 
-class PlaylistItem(BaseModel):
+class PlaylistItem(pydantic.BaseModel):
     """A single text segment to be converted to speech and played."""
 
-    idx: int = Field(..., description="Zero-based position in playlist")
-    audio_item: AudioItem = Field(..., description="Audio item to play")
-    audio_queue: "queue.Queue[bytes | None]" = Field(
+    idx: int = pydantic.Field(..., description="Zero-based position in playlist")
+    audio_item: AudioItem = pydantic.Field(..., description="Audio item to play")
+    audio_queue: "queue.Queue[bytes | None]" = pydantic.Field(
         default_factory=lambda: queue.Queue(maxsize=150)
     )
-    state: ItemState = Field(default=ItemState.IDLE)
+    state: ItemState = pydantic.Field(default=ItemState.IDLE)
 
-    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+    model_config = pydantic.ConfigDict(
+        validate_assignment=True, arbitrary_types_allowed=True
+    )
 
 
-class Playlist(BaseModel):
-    items: List[PlaylistItem] = Field(
+class Playlist(pydantic.BaseModel):
+    items: typing.List[PlaylistItem] = pydantic.Field(
         default_factory=list, description="List of playlist items"
     )
-    audio_producer_threads: List[threading.Thread] = Field(
+    audio_producer_threads: typing.List[threading.Thread] = pydantic.Field(
         default_factory=list, description="List of audio producer threads"
     )
-    start_event: threading.Event = Field(
+    start_event: threading.Event = pydantic.Field(
         default_factory=threading.Event,
         description="Event to signal when playback should start",
     )
-    stop_event: threading.Event = Field(
+    stop_event: threading.Event = pydantic.Field(
         default_factory=threading.Event,
         description="Event to signal when playback should stop",
     )
 
-    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+    model_config = pydantic.ConfigDict(
+        validate_assignment=True, arbitrary_types_allowed=True
+    )
 
-    def __iter__(self) -> Generator[PlaylistItem, None, None]:
+    def __iter__(self) -> typing.Generator[PlaylistItem, None, None]:
         for item in self.items:
             yield item
 
@@ -297,7 +300,7 @@ def create_audio_callback(
     return audio_callback
 
 
-def output_audio(audio_items: List[AudioItem]) -> None:
+def output_audio(audio_items: typing.Sequence[AudioItem]) -> None:
     if not audio_items:
         return
 
