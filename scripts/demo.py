@@ -11,35 +11,59 @@ from output_audio import (
 
 
 def demo_english():
+    print("🇺🇸 Starting English TTS demo...")
 
     # Create demo playlist
-    demo_items = [
-        OpenAITTSAudioItem(
-            content="Part 1: Hello, welcome to the OpenAI text-to-speech demonstration."
-        ),
-        OpenAITTSAudioItem(
-            content="Part 2: Now we enter the second sentence, and we will seamlessly continue from the previous segment."  # noqa: E501
-        ),
+    texts = [
+        "Part 1: Hello, welcome to the OpenAI text-to-speech demonstration.",
+        "Part 2: Now we enter the second sentence, and we will seamlessly continue from the previous segment.",  # noqa: E501
     ]
 
+    print(f"📝 Creating {len(texts)} demo items...")
+    demo_items = []
+    for i, text in enumerate(texts):
+        print(f"  Creating item {i+1}: {text[:50]}...")
+        try:
+            demo_items.append(OpenAITTSAudioItem(content=text))
+            print(f"  ✅ Item {i+1} created successfully")
+        except Exception as e:
+            print(f"  ❌ Failed to create item {i+1}: {e}")
+
     # Play demo
-    output_audio(demo_items)
-    print("✅ Demo completed!")
+    print("🎵 Starting audio playback...")
+    try:
+        output_audio(demo_items)
+        print("✅ English demo completed!")
+    except Exception as e:
+        print(f"❌ English demo failed: {e}")
 
 
 def demo_mandarin():
+    print("🇹🇼 Starting Mandarin TTS demo...")
 
     # Create demo playlist
-    demo_items = [
-        OpenAITTSAudioItem(content="第一段：你好，歡迎收聽 OpenAI 文字轉語音示範。"),
-        OpenAITTSAudioItem(
-            content="第二段：現在進入第二句，我們會無縫接在上一段後面。"
-        ),
+    texts = [
+        "第一段：你好，歡迎收聽 OpenAI 文字轉語音示範。",
+        "第二段：現在進入第二句，我們會無縫接在上一段後面。",
     ]
 
+    print(f"📝 Creating {len(texts)} demo items...")
+    demo_items = []
+    for i, text in enumerate(texts):
+        print(f"  Creating item {i+1}: {text[:50]}...")
+        try:
+            demo_items.append(OpenAITTSAudioItem(content=text))
+            print(f"  ✅ Item {i+1} created successfully")
+        except Exception as e:
+            print(f"  ❌ Failed to create item {i+1}: {e}")
+
     # Play demo
-    output_audio(demo_items)
-    print("✅ Demo completed!")
+    print("🎵 Starting audio playback...")
+    try:
+        output_audio(demo_items)
+        print("✅ Mandarin demo completed!")
+    except Exception as e:
+        print(f"❌ Mandarin demo failed: {e}")
 
 
 def demo_playlist_dynamic():
@@ -88,11 +112,11 @@ def demo_playlist_dynamic():
 
 
 if __name__ == "__main__":
-    # demo_english()
-    # time.sleep(1.0)
+    demo_english()
+    time.sleep(1.0)
 
-    # demo_mandarin()
-    # time.sleep(1.0)
+    demo_mandarin()
+    time.sleep(1.0)
 
     demo_playlist_dynamic()
     time.sleep(1.0)
