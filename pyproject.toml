@@ -8,6 +8,11 @@ readme = "README.md"
 requires-python = ">=3.11,<4"
 version = "0.1.0"
 
+[project.urls]
+"Bug Tracker" = "https://github.com/allen2c/output-audio/issues"
+Homepage = "https://github.com/allen2c/output-audio"
+Repository = "https://github.com/allen2c/output-audio"
+
 [project.optional-dependencies]
 all = ["openai (>=1.53,<2.0)"]
 
