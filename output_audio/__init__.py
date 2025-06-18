@@ -1,15 +1,20 @@
-# /Users/allenchou/works/ac/output-audio/output_audio/__init__.py
+# output_audio/__init__.py
+import os
 import queue
 import threading
 import time
 import typing
 from enum import Enum
 
+import azure.cognitiveservices.speech as speechsdk
 import numpy as np
 import openai
 import pydantic
 import sounddevice as sd
 import typing_extensions
+from str_or_none import str_or_none
+
+__version__ = "0.2.0"
 
 # Audio Configuration Constants
 SAMPLE_RATE: int = 24_000  # Hz (matches OpenAI PCM output)
@@ -56,6 +61,23 @@ class TTSAudioConfig(AudioConfig):
     )
 
 
+class AzureTTSAudioConfig(AudioConfig):
+    subscription: pydantic.SecretStr | None = pydantic.Field(
+        default=None, description="Azure TTS subscription key"
+    )
+    region: str = pydantic.Field(default="eastasia", description="Azure TTS region")
+    voice: (
+        typing.Literal[
+            "en-US-NovaTurboMultilingualNeural",
+            "ja-JP-MayuNeural",
+            "zh-TW-HsiaoChenNeural",
+        ]
+        | str
+    ) = pydantic.Field(
+        default="en-US-NovaTurboMultilingualNeural", description="Azure TTS voice"
+    )
+
+
 class AudioItem(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(validate_assignment=True)
 
@@ -96,6 +118,74 @@ class OpenAITTSAudioItem(AudioItem):
             # Stream chunks directly to queue as they arrive
             for chunk in response.iter_bytes(chunk_size=chunk_size):
                 yield chunk
+
+
+class AzureTTSAudioItem(AudioItem):
+    model_config = pydantic.ConfigDict(validate_assignment=True)
+
+    audio_config: AzureTTSAudioConfig | None = None
+
+    content: str
+
+    @typing_extensions.override
+    def read(
+        self,
+        chunk_size: int = CHUNK_BYTES,
+    ) -> typing.Generator[bytes, None, None]:
+        audio_config = (
+            AzureTTSAudioConfig() if self.audio_config is None else self.audio_config
+        )
+
+        # Ensure subscription is available
+        if audio_config.subscription is None:
+            _might_subscription = str_or_none(os.getenv("AZURE_SUBSCRIPTION"))
+            if not _might_subscription:
+                raise ValueError("AZURE_SUBSCRIPTION is not set")
+            audio_config.subscription = pydantic.SecretStr(_might_subscription)
+
+        # Configure Azure Speech SDK
+        speech_config = speechsdk.SpeechConfig(
+            subscription=audio_config.subscription.get_secret_value(),
+            region=audio_config.region,
+        )
+
+        # Set voice
+        speech_config.speech_synthesis_voice_name = audio_config.voice
+
+        # Set audio format to match our constants (16-bit PCM, 24kHz, mono)
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
+        )
+
+        # Create synthesizer
+        synthesizer = speechsdk.SpeechSynthesizer(
+            speech_config=speech_config, audio_config=None
+        )
+
+        # Perform synthesis and get result
+        result = synthesizer.speak_text_async(self.content).get()
+
+        if (
+            result
+            and result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted
+        ):
+            # Get the audio data
+            audio_data = result.audio_data
+
+            # Yield audio data in chunks
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i : i + chunk_size]
+                yield chunk
+
+        elif result and result.reason == speechsdk.ResultReason.Canceled:
+            cancellation_details = speechsdk.CancellationDetails(result)
+            raise RuntimeError(
+                f"Speech synthesis canceled: {cancellation_details.reason}, "
+                f"{cancellation_details.error_details}"
+            )
+        else:
+            reason = result.reason if result else "Unknown"
+            raise RuntimeError(f"Speech synthesis failed with reason: {reason}")
 
 
 class PlaylistItem(pydantic.BaseModel):
