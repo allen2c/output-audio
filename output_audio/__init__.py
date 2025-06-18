@@ -17,7 +17,7 @@ from google.cloud import texttospeech
 from google.genai import types
 from str_or_none import str_or_none
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # Audio Configuration Constants
 SAMPLE_RATE: int = 24_000  # Hz (matches OpenAI PCM output)
@@ -148,6 +148,15 @@ class GoogleTTSAudioConfig(AudioConfig):
     ) = pydantic.Field(default="cmn-TW-Wavenet-A", description="Google TTS voice")
     credentials_path: str | None = pydantic.Field(
         default=None, description="Path to Google Cloud service account JSON file"
+    )
+    speaking_rate: float = pydantic.Field(
+        default=1.3,
+        le=0.25,
+        ge=2.0,
+        description=(
+            "Speaking rate/speed, in the range [0.25, 2.0]. "
+            + "1.0 is the normal native speed supported by the specific voice."
+        ),
     )
 
 
@@ -370,6 +379,7 @@ class GoogleTTSAudioItem(AudioItem):
         tts_audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
             sample_rate_hertz=SAMPLE_RATE,  # 24000 Hz
+            speaking_rate=audio_config.speaking_rate,
         )
 
         # Perform synthesis (non-streaming for regular Google TTS)

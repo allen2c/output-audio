@@ -14,7 +14,7 @@ license = { text = "MIT" }
 name = "output-audio"
 readme = "README.md"
 requires-python = ">=3.11,<4"
-version = "0.2.1"
+version = "0.2.2"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/allen2c/output-audio/issues"
