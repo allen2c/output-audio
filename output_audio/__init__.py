@@ -17,7 +17,7 @@ from google.cloud import texttospeech
 from google.genai import types
 from str_or_none import str_or_none
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # Audio Configuration Constants
 SAMPLE_RATE: int = 24_000  # Hz (matches OpenAI PCM output)
