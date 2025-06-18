@@ -13,6 +13,7 @@ import pydantic
 import sounddevice as sd
 import typing_extensions
 from google import genai
+from google.cloud import texttospeech
 from google.genai import types
 from str_or_none import str_or_none
 
@@ -125,6 +126,28 @@ class GeminiTTSAudioConfig(AudioConfig):
     ) = pydantic.Field(default="Leda", description="Gemini TTS voice")
     api_key: pydantic.SecretStr | None = pydantic.Field(
         default=None, description="Gemini API key"
+    )
+
+
+class GoogleTTSAudioConfig(AudioConfig):
+    language_code: (
+        typing.Literal[
+            "cmn-TW",
+            "ja-JP",
+            "en-US",
+        ]
+        | str
+    ) = pydantic.Field(default="cmn-TW", description="Google TTS language code")
+    voice: (
+        typing.Literal[
+            "cmn-TW-Wavenet-A",
+            "ja-JP-Wavenet-A",
+            "en-US-Wavenet-A",
+        ]
+        | str
+    ) = pydantic.Field(default="cmn-TW-Wavenet-A", description="Google TTS voice")
+    credentials_path: str | None = pydantic.Field(
+        default=None, description="Path to Google Cloud service account JSON file"
     )
 
 
@@ -292,6 +315,70 @@ class GeminiTTSAudioItem(AudioItem):
 
         if audio_data is None:
             raise RuntimeError("No audio data received from Gemini TTS API")
+
+        # Yield audio data in chunks
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i : i + chunk_size]
+            yield chunk
+
+
+class GoogleTTSAudioItem(AudioItem):
+    model_config = pydantic.ConfigDict(validate_assignment=True)
+
+    audio_config: GoogleTTSAudioConfig | None = None
+
+    content: str
+
+    @typing_extensions.override
+    def read(
+        self,
+        chunk_size: int = CHUNK_BYTES,
+    ) -> typing.Generator[bytes, None, None]:
+        audio_config = (
+            GoogleTTSAudioConfig() if self.audio_config is None else self.audio_config
+        )
+
+        # Handle credentials explicitly
+        credentials_path = audio_config.credentials_path
+        if credentials_path is None:
+            # Try to get from environment variable
+            _might_credentials_path = str_or_none(
+                os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            )
+            if not _might_credentials_path:
+                raise ValueError(
+                    "GOOGLE_APPLICATION_CREDENTIALS environment variable is not set"
+                )
+            credentials_path = _might_credentials_path
+
+        from google.oauth2 import service_account
+
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path
+        )
+        client = texttospeech.TextToSpeechClient(credentials=credentials)
+
+        # Set up synthesis input
+        synthesis_input = texttospeech.SynthesisInput(text=self.content)
+
+        # Set up voice selection
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=audio_config.language_code, name=audio_config.voice
+        )
+
+        # Set up audio config to match our constants (24kHz, 16-bit PCM, mono)
+        tts_audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=SAMPLE_RATE,  # 24000 Hz
+        )
+
+        # Perform synthesis (non-streaming for regular Google TTS)
+        response = client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=tts_audio_config
+        )
+
+        # Get the audio data
+        audio_data = response.audio_content
 
         # Yield audio data in chunks
         for i in range(0, len(audio_data), chunk_size):

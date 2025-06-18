@@ -2,6 +2,7 @@
 authors = [{ name = "Allen Chou", email = "f1470891079@gmail.com" }]
 dependencies = [
   "azure-cognitiveservices-speech (>=1.40.0,<2.0.0)",
+  "google-cloud-texttospeech (>=2.20.0,<3.0.0)",
   "google-genai (>=1.16.1,<2.0.0)",
   "numpy (>=2,<3)",
   "pydantic (>=2,<3)",
