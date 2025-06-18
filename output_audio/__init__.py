@@ -12,6 +12,8 @@ import openai
 import pydantic
 import sounddevice as sd
 import typing_extensions
+from google import genai
+from google.genai import types
 from str_or_none import str_or_none
 
 __version__ = "0.2.0"
@@ -45,7 +47,7 @@ class AudioConfig(pydantic.BaseModel):
     )
 
 
-class TTSAudioConfig(AudioConfig):
+class OpenAITTSAudioConfig(AudioConfig):
     # model: str = "tts-1"
     model: str = "gpt-4o-mini-tts"
     voice: str = "nova"
@@ -59,6 +61,10 @@ class TTSAudioConfig(AudioConfig):
     openai_client: typing.Union["openai.OpenAI", "openai.AzureOpenAI"] = pydantic.Field(
         default_factory=lambda: openai.OpenAI()
     )
+
+
+class TTSAudioConfig(OpenAITTSAudioConfig):
+    pass
 
 
 class AzureTTSAudioConfig(AudioConfig):
@@ -75,6 +81,50 @@ class AzureTTSAudioConfig(AudioConfig):
         | str
     ) = pydantic.Field(
         default="en-US-NovaTurboMultilingualNeural", description="Azure TTS voice"
+    )
+
+
+class GeminiTTSAudioConfig(AudioConfig):
+    model: typing.Literal["gemini-2.5-flash-preview-tts"] | str = pydantic.Field(
+        default="gemini-2.5-flash-preview-tts", description="Gemini TTS model"
+    )
+    voice: (
+        typing.Literal[
+            "Achernar",  # Soft
+            "Achird",  # Friendly
+            "Algenib",  # Gravelly
+            "Algieba",  # Smooth
+            "Alnilam",  # Firm
+            "Aoede",  # Breezy
+            "Autonoe",  # Bright
+            "Callirrhoe",  # Easy-going
+            "Charon",  # Informative
+            "Despina",  # Smooth
+            "Enceladus",  # Breathy
+            "Erinome",  # Clear
+            "Fenrir",  # Excitable
+            "Gacrux",  # Mature
+            "Iapetus",  # Clear
+            "Kore",  # Firm
+            "Laomedeia",  # Upbeat
+            "Leda",  # Youthful
+            "Orus",  # Firm
+            "Puck",  # Upbeat
+            "Pulcherrima",  # Forward
+            "Rasalgethi",  # Informative
+            "Sadachbia",  # Lively
+            "Sadaltager",  # Knowledgeable
+            "Schedar",  # Even
+            "Sulafat",  # Warm
+            "Umbriel",  # Easy-going
+            "Vindemiatrix",  # Gentle
+            "Zephyr",  # Bright
+            "Zubenelgenubi",  # Casual
+        ]
+        | str
+    ) = pydantic.Field(default="Leda", description="Gemini TTS voice")
+    api_key: pydantic.SecretStr | None = pydantic.Field(
+        default=None, description="Gemini API key"
     )
 
 
@@ -186,6 +236,67 @@ class AzureTTSAudioItem(AudioItem):
         else:
             reason = result.reason if result else "Unknown"
             raise RuntimeError(f"Speech synthesis failed with reason: {reason}")
+
+
+class GeminiTTSAudioItem(AudioItem):
+    model_config = pydantic.ConfigDict(validate_assignment=True)
+
+    audio_config: GeminiTTSAudioConfig | None = None
+
+    content: str
+
+    @typing_extensions.override
+    def read(
+        self,
+        chunk_size: int = CHUNK_BYTES,
+    ) -> typing.Generator[bytes, None, None]:
+        audio_config = (
+            GeminiTTSAudioConfig() if self.audio_config is None else self.audio_config
+        )
+        if audio_config.api_key is None:
+            # Get API key from environment
+            _might_api_key = str_or_none(os.getenv("GEMINI_API_KEY"))
+            if not _might_api_key:
+                raise ValueError("GEMINI_API_KEY environment variable is not set")
+            audio_config.api_key = pydantic.SecretStr(_might_api_key)
+
+        # Create Gemini client
+        client = genai.Client(api_key=audio_config.api_key.get_secret_value())
+
+        # Generate audio content
+        response = client.models.generate_content(
+            model=audio_config.model,
+            contents=self.content,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=audio_config.voice,
+                        )
+                    )
+                ),
+            ),
+        )
+
+        # Extract audio data with proper error handling
+        if (
+            not response.candidates
+            or not response.candidates[0].content
+            or not response.candidates[0].content.parts
+            or not response.candidates[0].content.parts[0].inline_data
+        ):
+            raise RuntimeError("Invalid response from Gemini TTS API")
+
+        audio_data = response.candidates[0].content.parts[0].inline_data.data
+
+        if audio_data is None:
+            raise RuntimeError("No audio data received from Gemini TTS API")
+
+        # Yield audio data in chunks
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i : i + chunk_size]
+            yield chunk
 
 
 class PlaylistItem(pydantic.BaseModel):
