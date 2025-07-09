@@ -244,8 +244,8 @@ def demo_google_tts():
         except Exception as e:
             print(f"  ❌ Failed to add item {i+1}: {e}")
 
-    print("⏰ Waiting 5 seconds for playback to complete...")
-    time.sleep(5.0)
+    print("⏰ Waiting 3 seconds for playback to complete...")
+    time.sleep(3.0)
 
     print("🛑 Setting stop event...")
     playback_stop_event.set()

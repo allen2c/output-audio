@@ -1,4 +1,5 @@
 # output_audio/__init__.py
+import logging
 import os
 import queue
 import threading
@@ -17,7 +18,7 @@ from google.cloud import texttospeech
 from google.genai import types
 from str_or_none import str_or_none
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 # Audio Configuration Constants
 SAMPLE_RATE: int = 24_000  # Hz (matches OpenAI PCM output)
@@ -33,18 +34,28 @@ PRE_BUFFER_DURATION: float = 0.2  # Seconds of audio to buffer before playback s
 ITEM_SILENCE: bytes = b"\x00" * int(SAMPLE_RATE * 0.05) * 2  # 50ms between items
 FINAL_SILENCE: bytes = b"\x00" * int(SAMPLE_RATE * 0.2) * 2  # 200ms at end
 
+logger = logging.getLogger(__name__)
+
 
 class ItemState(str, Enum):
     """Playback state for monitoring (not used for synchronization)."""
 
     IDLE = "idle"
     STREAMING = "streaming"
-    DONE = "done"
+    READY = "ready"
 
 
 class AudioConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(
         validate_assignment=True, arbitrary_types_allowed=True
+    )
+
+    # Retry configuration
+    max_retries: int = pydantic.Field(
+        default=3, ge=0, description="Maximum number of retries on failure"
+    )
+    retry_delay: float = pydantic.Field(
+        default=1.0, ge=0.0, description="Delay between retries in seconds"
     )
 
 
@@ -151,8 +162,8 @@ class GoogleTTSAudioConfig(AudioConfig):
     )
     speaking_rate: float = pydantic.Field(
         default=1.3,
-        le=0.25,
-        ge=2.0,
+        ge=0.25,
+        le=2.0,
         description=(
             "Speaking rate/speed, in the range [0.25, 2.0]. "
             + "1.0 is the normal native speed supported by the specific voice."
@@ -410,6 +421,23 @@ class PlaylistItem(pydantic.BaseModel):
         validate_assignment=True, arbitrary_types_allowed=True
     )
 
+    def set_state(self, new_state: ItemState) -> None:
+        """Safely transition to a new state with validation."""
+        valid_transitions = {
+            ItemState.IDLE: [ItemState.STREAMING],
+            ItemState.STREAMING: [ItemState.READY],
+            ItemState.READY: [ItemState.IDLE],  # Allow reset
+        }
+
+        if new_state not in valid_transitions.get(self.state, []):
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"Invalid state transition from {self.state} to {new_state} "
+                f"for item {self.idx}"
+            )
+
+        self.state = new_state
+
 
 class Playlist(pydantic.BaseModel):
     items: typing.List[PlaylistItem] = pydantic.Field(
@@ -427,6 +455,19 @@ class Playlist(pydantic.BaseModel):
         description="Event to signal when playback should stop",
     )
     current_idx: int = pydantic.Field(default=0, description="Next item to play")
+
+    # References to playback queue and buffer
+    playback_queue: "queue.Queue[bytes | None] | None" = pydantic.Field(
+        default=None, description="Reference to playback queue"
+    )
+    buffer_remainder: "bytearray | None" = pydantic.Field(
+        default=None, description="Reference to buffer remainder"
+    )
+
+    # Performance metrics
+    metrics: typing.Dict[str, typing.Any] = pydantic.Field(
+        default_factory=dict, description="Performance and status metrics"
+    )
 
     model_config = pydantic.ConfigDict(
         validate_assignment=True, arbitrary_types_allowed=True
@@ -458,6 +499,63 @@ class Playlist(pydantic.BaseModel):
             thread = threading.Thread(target=self._run_audio_producer, args=(item,))
             self.audio_producer_threads.append(thread)
             thread.start()
+
+    def is_all_items_ready(self) -> bool:
+        """Check if all playlist items are done (basic check)."""
+        return all(item.state == ItemState.READY for item in self.items)
+
+    def is_playback_finished(self) -> bool:
+        """Check if all playlist items are done AND all buffers are empty."""
+        if not self.items:
+            return True
+
+        # Check if all items are done
+        all_ready = all(item.state == ItemState.READY for item in self.items)
+
+        # Check if playback queue and buffer are empty
+        queue_empty = True
+        buffer_empty = True
+
+        if self.playback_queue is not None:
+            queue_empty = self.playback_queue.empty()
+
+        if self.buffer_remainder is not None:
+            buffer_empty = not self.buffer_remainder
+
+        return all_ready and queue_empty and buffer_empty
+
+    def _set_playback_references(
+        self, playback_queue: "queue.Queue[bytes | None]", buffer_remainder: bytearray
+    ) -> None:
+        """Internal method to set references to playback queue and buffer."""
+        self.playback_queue = playback_queue
+        self.buffer_remainder = buffer_remainder
+
+    def get_metrics(self) -> typing.Dict[str, typing.Any]:
+        """Get current performance and status metrics."""
+        queue_size = 0
+        buffer_size = 0
+
+        if self.playback_queue is not None:
+            queue_size = self.playback_queue.qsize()
+        if self.buffer_remainder is not None:
+            buffer_size = len(self.buffer_remainder)
+
+        return {
+            "total_items": len(self.items),
+            "current_idx": self.current_idx,
+            "active_threads": len(
+                [t for t in self.audio_producer_threads if t.is_alive()]
+            ),
+            "queue_size": queue_size,
+            "buffer_size": buffer_size,
+            "items_by_state": {
+                state.value: len([item for item in self.items if item.state == state])
+                for state in ItemState
+            },
+            "is_playing": self.start_event.is_set() and not self.stop_event.is_set(),
+            "playback_finished": self.is_playback_finished(),
+        }
 
     def play(
         self,
@@ -530,7 +628,7 @@ class Playlist(pydantic.BaseModel):
         for item in self.items:
             while not item.audio_queue.empty():
                 item.audio_queue.get()
-                item.state = ItemState.IDLE
+                item.set_state(ItemState.IDLE)
 
         self.audio_producer_threads.clear()
         self.start_event.clear()
@@ -541,8 +639,11 @@ class Playlist(pydantic.BaseModel):
         """
         Streams TTS audio for a single item into its dedicated queue.
         """
+        logger = logging.getLogger(__name__)
+
         # Update state for monitoring (non-blocking)
-        item.state = ItemState.STREAMING
+        item.set_state(ItemState.STREAMING)
+        logger.debug(f"[Producer {item.idx}] Starting audio production")
 
         # Pre-buffering mechanism: accumulate initial data before playback
         initial_buffer = []
@@ -556,6 +657,7 @@ class Playlist(pydantic.BaseModel):
         try:
             for chunk in item.audio_item.read(chunk_size=CHUNK_BYTES):
                 if self.stop_event.is_set():
+                    logger.debug(f"[Producer {item.idx}] Stop event detected, breaking")
                     break
 
                 # Accumulate initial buffer
@@ -565,6 +667,10 @@ class Playlist(pydantic.BaseModel):
 
                     # Release all buffered data once we have enough
                     if current_buffer_size >= initial_buffer_size:
+                        logger.debug(
+                            f"[Producer {item.idx}] Pre-buffer complete, "
+                            f"releasing {len(initial_buffer)} chunks"
+                        )
                         for buffered_chunk in initial_buffer:
                             item.audio_queue.put(buffered_chunk)
                         initial_buffer = []  # Clear buffer list
@@ -574,7 +680,9 @@ class Playlist(pydantic.BaseModel):
 
         except Exception as exc:
             # On error, inject silence to keep playlist flowing
-            print(f"[Producer {item.idx}] Error: {exc!r}")
+            logger.error(
+                f"[Producer {item.idx}] Error during audio production: {exc!r}"
+            )
             # Release any remaining buffered data
             for buffered_chunk in initial_buffer:
                 item.audio_queue.put(buffered_chunk)
@@ -586,7 +694,8 @@ class Playlist(pydantic.BaseModel):
                 item.audio_queue.put(buffered_chunk)
             # Signal completion with sentinel value
             item.audio_queue.put(None)  # Merger will recognize this as end-of-item
-            item.state = ItemState.DONE
+            item.set_state(ItemState.READY)
+            logger.debug(f"[Producer {item.idx}] Audio production completed")
 
 
 class ManualStopException(Exception):
@@ -599,7 +708,7 @@ class ManualStopException(Exception):
 
 
 def create_audio_callback(
-    playback_queue: "queue.Queue[bytes]",
+    playback_queue: "queue.Queue[typing.Optional[bytes]]",
     buffer_remainder: bytearray,
     playback_started: threading.Event,
 ):
@@ -625,7 +734,9 @@ def create_audio_callback(
         # Fill buffer from queue until we have enough data
         while len(audio_buffer) < bytes_needed:
             try:
-                audio_buffer.extend(playback_queue.get_nowait())
+                _might_bytes = playback_queue.get_nowait()
+                if _might_bytes is not None:
+                    audio_buffer.extend(_might_bytes)
             except queue.Empty:
                 break  # No more data available right now
 
@@ -661,7 +772,7 @@ def output_audio(audio_items: typing.Sequence[AudioItem]) -> None:
     playlist.start_audio_producer()
 
     # Global queue that feeds the audio output device
-    playback_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=300)
+    playback_queue: "queue.Queue[typing.Optional[bytes]]" = queue.Queue(maxsize=300)
 
     # Start playlist playback
     playlist_playback_thread = threading.Thread(
@@ -713,7 +824,7 @@ def output_playlist_audio(
     playlist.start_audio_producer()
 
     # Global queue that feeds the audio output device
-    playback_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=300)
+    playback_queue: "queue.Queue[typing.Optional[bytes]]" = queue.Queue(maxsize=300)
 
     # Start playlist playback
     playlist_playback_thread = threading.Thread(
@@ -727,6 +838,9 @@ def output_playlist_audio(
     # Set up audio output
     buffer_remainder = bytearray()
     playback_started = threading.Event()
+
+    # Set references in playlist so it can check buffer status
+    playlist._set_playback_references(playback_queue, buffer_remainder)
 
     # Start PortAudio stream - this begins immediate playback
     with sd.OutputStream(
